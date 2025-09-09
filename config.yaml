@@ -1,0 +1,6 @@
+tabs:
+  SSHFS:
+    dev-monitoring-01:
+      exec: echo
+      args:
+        - hello
