@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 
 	"fyne.io/fyne/v2"
@@ -19,44 +18,34 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config represents the YAML configuration structure
 type Config struct {
 	Tabs map[string]map[string]Command `yaml:"tabs"`
 }
-
-// Command represents a command to execute
 type Command struct {
 	Exec string   `yaml:"exec"`
 	Args []string `yaml:"args"`
 }
-
-// ProcessState tracks the state of a running process
 type ProcessState struct {
 	Cmd     *exec.Cmd
 	Running bool
 	Output  []string
 	Mutex   sync.Mutex
+	HasRun  bool // Track if this process has been run at least once
 }
-
-// TabData represents UI tab data
 type TabData struct {
 	Title string
 	Rows  []RowData
 }
-
-// RowData represents UI row data
 type RowData struct {
 	Title       string
 	Description string
 	Command     Command
 }
 
-// Global variables to track process states
 var processStates = make(map[string]*ProcessState)
 var config Config
 
 func main() {
-	// Load configuration from YAML file
 	configFile := "config.yaml"
 	if len(os.Args) > 1 {
 		configFile = os.Args[1]
@@ -67,16 +56,10 @@ func main() {
 		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Create the application
 	myApp := app.New()
 	myWindow := myApp.NewWindow("Command Runner")
 	myWindow.Resize(fyne.NewSize(600, 480))
-
-	// Convert config to UI data
 	tabsData := convertConfigToTabsData(config)
-
-	// Create tabs with icons
 	tabs := container.NewAppTabs()
 
 	for _, tabData := range tabsData {
@@ -136,52 +119,46 @@ func createTabContent(tabData TabData) fyne.CanvasObject {
 }
 
 func createRowWidget(row RowData) *fyne.Container {
-	// Create a unique key for this process
 	processKey := fmt.Sprintf("%s-%s", row.Title, row.Description)
-
-	// Main title
+	if _, exists := processStates[processKey]; !exists {
+		processStates[processKey] = &ProcessState{
+			Output: []string{"No logs available. Run the process to see logs."},
+		}
+	}
 	titleLabel := widget.NewLabel(row.Title)
 	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	// Description
 	descLabel := widget.NewLabel(row.Description)
 	descLabel.TextStyle = fyne.TextStyle{Italic: true}
-
-	// Status label
 	statusLabel := widget.NewLabel("Stopped")
 	statusLabel.Alignment = fyne.TextAlignTrailing
-
-	// Run/Stop button
 	actionButton := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), nil)
 	actionButton.Importance = widget.SuccessImportance
-
-	// Logs button
 	logsButton := widget.NewButtonWithIcon("Logs", theme.DocumentIcon(), nil)
 	logsButton.Importance = widget.MediumImportance
-	logsButton.Hide() // Initially hidden
-
-	// Update button state based on process state
 	updateButtonState := func() {
-		if state, exists := processStates[processKey]; exists && state.Running {
+		state := processStates[processKey]
+		if state.Running {
 			actionButton.SetIcon(theme.MediaStopIcon())
 			actionButton.Text = "" // Clear text to show only icon
 			statusLabel.SetText("Running")
-			logsButton.Show()
+			logsButton.Enable()
 		} else {
 			actionButton.SetIcon(theme.MediaPlayIcon())
 			actionButton.Text = "" // Clear text to show only icon
 			statusLabel.SetText("Stopped")
-			logsButton.Hide()
+			if state.HasRun {
+				logsButton.Enable()
+			} else {
+				logsButton.Disable()
+			}
 		}
 		actionButton.Refresh()
 		logsButton.Refresh()
 		statusLabel.Refresh()
 	}
-
-	// Set up action button click handler
 	actionButton.OnTapped = func() {
-		if state, exists := processStates[processKey]; exists && state.Running {
-			// Stop the process
+		state := processStates[processKey]
+		if state.Running {
 			state.Mutex.Lock()
 			if state.Cmd != nil && state.Cmd.Process != nil {
 				state.Cmd.Process.Kill()
@@ -190,52 +167,38 @@ func createRowWidget(row RowData) *fyne.Container {
 			state.Mutex.Unlock()
 			fyne.Do(updateButtonState)
 		} else {
-			// Start the process
+			state.Mutex.Lock()
+			state.Output = []string{fmt.Sprintf("Starting process: %s %v", row.Command.Exec, row.Command.Args)}
+			state.HasRun = true
+			state.Mutex.Unlock()
 			cmd := exec.Command(row.Command.Exec, row.Command.Args...)
-
-			// Create pipes for capturing output
 			stdoutPipe, err := cmd.StdoutPipe()
 			if err != nil {
 				fmt.Printf("Error creating stdout pipe: %v\n", err)
+				state.Mutex.Lock()
+				state.Output = append(state.Output, fmt.Sprintf("Error creating stdout pipe: %v", err))
+				state.Mutex.Unlock()
 				return
 			}
 
 			stderrPipe, err := cmd.StderrPipe()
 			if err != nil {
 				fmt.Printf("Error creating stderr pipe: %v\n", err)
+				state.Mutex.Lock()
+				state.Output = append(state.Output, fmt.Sprintf("Error creating stderr pipe: %v", err))
+				state.Mutex.Unlock()
 				return
 			}
-
-			// Initialize process state
-			processStates[processKey] = &ProcessState{
-				Cmd:     cmd,
-				Running: true,
-				Output:  []string{},
-			}
-
-			// Start the process
-			err = cmd.Start()
-			if err != nil {
-				fmt.Printf("Error starting process: %v\n", err)
-				processStates[processKey].Running = false
-				processStates[processKey].Output = append(processStates[processKey].Output, fmt.Sprintf("Error: %v", err))
-				return
-			}
+			state.Mutex.Lock()
+			state.Cmd = cmd
+			state.Running = true
+			state.Mutex.Unlock()
 
 			fyne.Do(updateButtonState)
-
-			// Capture output in goroutines
 			go captureOutput(stdoutPipe, processKey, false)
 			go captureOutput(stderrPipe, processKey, true)
-
-			// Wait for process completion in goroutine
 			go func() {
-				err := cmd.Wait()
-
-				state, exists := processStates[processKey]
-				if !exists {
-					return
-				}
+				err := cmd.Run()
 
 				state.Mutex.Lock()
 				state.Running = false
@@ -245,35 +208,23 @@ func createRowWidget(row RowData) *fyne.Container {
 					state.Output = append(state.Output, "Process completed successfully")
 				}
 				state.Mutex.Unlock()
-
-				// Update UI by scheduling on the main thread
-				// Fyne handles this automatically through widget refreshes
 				fyne.Do(updateButtonState)
 			}()
 		}
 	}
-
-	// Set up logs button click handler
 	logsButton.OnTapped = func() {
-		if state, exists := processStates[processKey]; exists {
-			state.Mutex.Lock()
-			output := make([]string, len(state.Output))
-			copy(output, state.Output)
-			state.Mutex.Unlock()
-			showLogsDialog(row.Title, output)
-		}
+		state := processStates[processKey]
+		state.Mutex.Lock()
+		output := make([]string, len(state.Output))
+		copy(output, state.Output)
+		state.Mutex.Unlock()
+		showLogsDialog(row.Title, output)
 	}
-
-	// Initial button state
 	fyne.Do(updateButtonState)
-
-	// Vertical container for text content
 	textContent := container.NewVBox(
 		titleLabel,
 		descLabel,
 	)
-
-	// Horizontal container for the entire row
 	mainRow := container.NewHBox(
 		textContent,
 		layout.NewSpacer(),
@@ -281,8 +232,6 @@ func createRowWidget(row RowData) *fyne.Container {
 		container.NewPadded(logsButton),
 		container.NewPadded(actionButton),
 	)
-
-	// Add padding and border
 	paddedRow := container.NewPadded(mainRow)
 	borderedRow := container.NewBorder(
 		nil,
@@ -308,7 +257,7 @@ func captureOutput(reader io.ReadCloser, processKey string, isStderr bool) {
 		}
 
 		state.Mutex.Lock()
-		prefix := "OUT: "
+		prefix := ""
 		if isStderr {
 			prefix = "ERR: "
 		}
@@ -318,37 +267,26 @@ func captureOutput(reader io.ReadCloser, processKey string, isStderr bool) {
 
 	if err := scanner.Err(); err != nil {
 		fmt.Printf("Error reading output: %v\n", err)
+		state, exists := processStates[processKey]
+		if exists {
+			state.Mutex.Lock()
+			state.Output = append(state.Output, fmt.Sprintf("Error reading output: %v", err))
+			state.Mutex.Unlock()
+		}
 	}
 }
 
 func showLogsDialog(title string, output []string) {
-	// Create a dialog to show logs
 	logText := ""
 	for _, line := range output {
 		logText += line + "\n"
 	}
-
-	// Create a multi-line text widget for logs
 	logWidget := widget.NewMultiLineEntry()
 	logWidget.SetText(logText)
 	logWidget.Wrapping = fyne.TextWrapWord
-	logWidget.Resize(fyne.NewSize(600, 400))
-
-	// Create a container with scroll
 	scrollContainer := container.NewVScroll(logWidget)
-	scrollContainer.SetMinSize(fyne.NewSize(600, 400))
-
-	// Get the main window
-	mainWindow := fyne.CurrentApp().Driver().AllWindows()[0]
-
-	// Show custom dialog
-	dialog.ShowCustom(title, "Close", scrollContainer, mainWindow)
-}
-
-// Helper function to get absolute path
-func getAbsolutePath(path string) (string, error) {
-	if filepath.IsAbs(path) {
-		return path, nil
-	}
-	return filepath.Abs(path)
+	scrollContainer.SetMinSize(fyne.NewSize(800, 500))
+	customDialog := dialog.NewCustom(title, "Close", scrollContainer, fyne.CurrentApp().Driver().AllWindows()[0])
+	customDialog.Resize(fyne.NewSize(800, 500))
+	customDialog.Show()
 }
