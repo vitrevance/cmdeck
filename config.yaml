@@ -4,3 +4,7 @@ tabs:
       exec: echo
       args:
         - hello
+    sleep:
+      exec: sleep
+      args:
+        - 5

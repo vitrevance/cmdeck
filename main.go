@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "embed"
@@ -285,6 +286,10 @@ func createRowWidget(row RowData) *fyne.Container {
 			state.Mutex.Unlock()
 
 			cmd := exec.Command(row.Command.Exec, row.Command.Args...)
+
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				HideWindow: true,
+			}
 
 			stdoutPipe, err := cmd.StdoutPipe()
 			if err != nil {
